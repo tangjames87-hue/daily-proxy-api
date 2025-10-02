@@ -5,8 +5,6 @@ import os
 app = FastAPI()
 
 # ============== 环境变量读取 ==============
-BASE_URL = "https://daily-proxy-api.onrender.com"
-
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -29,33 +27,38 @@ def healthcheck():
 def analyze(ticker: str = "AAPL"):
     result = {"ticker": ticker}
 
+    # Finnhub - 股票价格
     try:
-        price = requests.get(f"{BASE_URL}/price?ticker={ticker}", timeout=15).json()
-        result["price"] = price
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+        result["price"] = requests.get(url, timeout=15).json()
     except Exception as e:
         result["price_error"] = str(e)
 
+    # Finnhub - 公司信息
     try:
-        company = requests.get(f"{BASE_URL}/company?ticker={ticker}", timeout=15).json()
-        result["company"] = company
+        url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_API_KEY}"
+        result["company"] = requests.get(url, timeout=15).json()
     except Exception as e:
         result["company_error"] = str(e)
 
+    # Finnhub - 公司新闻
     try:
-        news = requests.get(f"{BASE_URL}/finnhub-news?ticker={ticker}", timeout=20).json()
-        result["news"] = news[:5] if isinstance(news, list) else news
+        url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from=2025-09-01&to=2025-10-02&token={FINNHUB_API_KEY}"
+        result["news"] = requests.get(url, timeout=20).json()
     except Exception as e:
         result["news_error"] = str(e)
 
+    # FRED - 宏观数据 (CPI)
     try:
-        macro = requests.get(f"{BASE_URL}/fred/series?id=CPIAUCSL", timeout=20).json()
-        result["macro"] = macro
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&file_type=json"
+        result["macro"] = requests.get(url, timeout=20).json()
     except Exception as e:
         result["macro_error"] = str(e)
 
+    # FRED - 国债收益率
     try:
-        treasury = requests.get(f"{BASE_URL}/treasury/yield", timeout=20).json()
-        result["treasury"] = treasury
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={FRED_API_KEY}&file_type=json"
+        result["treasury"] = requests.get(url, timeout=20).json()
     except Exception as e:
         result["treasury_error"] = str(e)
 
