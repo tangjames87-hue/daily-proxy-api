@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 import requests
 import os
+import csv
+import io
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -76,12 +79,63 @@ def fred_series(id: str):
 # ============== Treasury ==============
 @app.get("/treasury/yield")
 def treasury_yield():
+    """
+    从 Treasury.gov 抓取每日收益率曲线，并解析为 JSON
+    """
     if TREASURY_API == "public":
         url = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-yield-curve-rates.csv"
         resp = requests.get(url).text
-        return {"source": "treasury.gov", "csv_sample": resp[:2000]}
+
+        # 解析 CSV
+        reader = csv.DictReader(io.StringIO(resp))
+        data = list(reader)
+
+        return {
+            "source": "treasury.gov",
+            "count": len(data),
+            "latest": data[-1] if data else None,  # 最近一行
+            "data": data[:30]  # 返回最近30行
+        }
     else:
         return {"error": f"Treasury API mode {TREASURY_API} not implemented"}
+
+# ============== ETF Source ==============
+@app.get("/etfdb")
+def etf_data(ticker: str):
+    """
+    从 etfdb.com 抓取 ETF 页面，解析基金规模、持仓 Top10
+    """
+    if ETF_SOURCE == "etfdb_free":
+        url = f"https://etfdb.com/etf/{ticker}/"
+        html = requests.get(url).text
+        soup = BeautifulSoup(html, "html.parser")
+
+        result = {"source": "etfdb", "ticker": ticker}
+
+        # 基金规模
+        try:
+            asset_tag = soup.find("div", text="Assets Under Management").find_next("div")
+            result["assets"] = asset_tag.text.strip()
+        except:
+            result["assets"] = None
+
+        # Top 10 持仓
+        try:
+            holdings_table = soup.find("table", {"class": "table-etf-holdings"})
+            holdings = []
+            if holdings_table:
+                rows = holdings_table.find_all("tr")[1:11]
+                for r in rows:
+                    cols = [c.get_text(strip=True) for c in r.find_all("td")]
+                    if cols:
+                        holdings.append({"name": cols[0], "weight": cols[-1]})
+            result["top_holdings"] = holdings
+        except:
+            result["top_holdings"] = []
+
+        return result
+    else:
+        return {"error": f"ETF source mode {ETF_SOURCE} not implemented"}
 
 # ============== NewsAPI ==============
 @app.get("/newsapi")
@@ -94,13 +148,3 @@ def get_news(query: str):
 def google_news(query: str):
     url = f"https://newsapi.org/v2/everything?q={query}&apiKey={GOOGLE_NEWS_API_KEY}"
     return requests.get(url).json()
-
-# ============== ETF Source ==============
-@app.get("/etfdb")
-def etf_data(ticker: str):
-    if ETF_SOURCE == "etfdb_free":
-        url = f"https://etfdb.com/etf/{ticker}/"
-        resp = requests.get(url).text
-        return {"source": "etfdb", "html_sample": resp[:2000]}
-    else:
-        return {"error": f"ETF source mode {ETF_SOURCE} not implemented"}
