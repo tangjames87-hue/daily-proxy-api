@@ -15,7 +15,6 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-GOOGLE_NEWS_API_KEY = os.getenv("GOOGLE_NEWS_API_KEY")
 ETF_SOURCE = os.getenv("ETF_SOURCE", "etfdb_free")
 TREASURY_API = os.getenv("TREASURY_API", "public")
 
@@ -84,17 +83,16 @@ def treasury_yield():
     """
     if TREASURY_API == "public":
         url = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-yield-curve-rates.csv"
-        resp = requests.get(url).text
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
 
-        # 解析 CSV
         reader = csv.DictReader(io.StringIO(resp))
         data = list(reader)
 
         return {
             "source": "treasury.gov",
             "count": len(data),
-            "latest": data[-1] if data else None,  # 最近一行
-            "data": data[:30]  # 返回最近30行
+            "latest": data[-1] if data else None,
+            "data": data[:30]
         }
     else:
         return {"error": f"Treasury API mode {TREASURY_API} not implemented"}
@@ -107,32 +105,36 @@ def etf_data(ticker: str):
     """
     if ETF_SOURCE == "etfdb_free":
         url = f"https://etfdb.com/etf/{ticker}/"
-        html = requests.get(url).text
+        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
         soup = BeautifulSoup(html, "html.parser")
 
         result = {"source": "etfdb", "ticker": ticker}
 
         # 基金规模
         try:
-            asset_tag = soup.find("div", text="Assets Under Management").find_next("div")
+            asset_tag = soup.find(text="Assets Under Management").find_next("div")
             result["assets"] = asset_tag.text.strip()
         except:
-            result["assets"] = None
+            try:
+                asset_tag = soup.find("div", class_="fund__data").find("span")
+                result["assets"] = asset_tag.text.strip()
+            except:
+                result["assets"] = None
 
         # Top 10 持仓
+        holdings = []
         try:
             holdings_table = soup.find("table", {"class": "table-etf-holdings"})
-            holdings = []
             if holdings_table:
                 rows = holdings_table.find_all("tr")[1:11]
                 for r in rows:
                     cols = [c.get_text(strip=True) for c in r.find_all("td")]
                     if cols:
                         holdings.append({"name": cols[0], "weight": cols[-1]})
-            result["top_holdings"] = holdings
         except:
-            result["top_holdings"] = []
+            pass
 
+        result["top_holdings"] = holdings
         return result
     else:
         return {"error": f"ETF source mode {ETF_SOURCE} not implemented"}
@@ -141,10 +143,4 @@ def etf_data(ticker: str):
 @app.get("/newsapi")
 def get_news(query: str):
     url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
-    return requests.get(url).json()
-
-# ============== Google News ==============
-@app.get("/google-news")
-def google_news(query: str):
-    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={GOOGLE_NEWS_API_KEY}"
     return requests.get(url).json()
