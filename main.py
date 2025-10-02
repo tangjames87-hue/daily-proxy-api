@@ -12,8 +12,6 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-ETF_SOURCE = os.getenv("ETF_SOURCE", "fmp")
-TREASURY_API = os.getenv("TREASURY_API", "fred")
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 # ============== 根路径健康检查 ==============
@@ -77,38 +75,42 @@ def fred_series(id: str = "CPIAUCSL"):
 @app.get("/treasury/yield")
 def treasury_yield():
     """
-    使用 FRED API 提供的国债收益率 (2Y, 10Y, 30Y)
+    使用 FRED API 提供的国债收益率 (2Y, 10Y, 30Y)，返回最新一条
     """
     series = {"2Y": "DGS2", "10Y": "DGS10", "30Y": "DGS30"}
     results = {}
-    for k, v in series.items():
-        url = f"https://api.stlouisfed.org/fred/series/observations?series_id={v}&api_key={FRED_API_KEY}&file_type=json"
+    for label, sid in series.items():
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={FRED_API_KEY}&file_type=json"
         data = requests.get(url).json()
         if "observations" in data and data["observations"]:
-            results[k] = data["observations"][-1]
+            results[label] = data["observations"][-1]
     return {"source": "FRED", "yields": results}
 
-# ============== ETF (FMP API) ==============
+# ============== ETF (FMP 新接口 etf-holder) ==============
 @app.get("/etf")
 def etf_data(ticker: str = "SPY"):
-    url = f"https://financialmodelingprep.com/api/v3/etf-holdings/{ticker}?apikey={FMP_API_KEY}"
+    """
+    从 FMP 新接口获取 ETF 持仓 (Top10)
+    """
+    url = f"https://financialmodelingprep.com/api/v3/etf-holder/{ticker}?apikey={FMP_API_KEY}"
     resp = requests.get(url)
     data = resp.json()
 
     result = {"source": "FMP", "ticker": ticker}
-    holdings = data.get("holdings", [])
-    if holdings:
-        result["top_holdings"] = [
+
+    if isinstance(data, list) and len(data) > 0:
+        top10 = [
             {
                 "name": h.get("asset"),
                 "symbol": h.get("symbol"),
                 "weight": h.get("weightPercentage")
             }
-            for h in holdings[:10]
+            for h in data[:10]
         ]
+        result["top_holdings"] = top10
     else:
         result["top_holdings"] = []
-        result["raw"] = data  # 👈 保留原始响应，方便调试
+        result["raw"] = data  # 保留原始返回，方便调试
 
     return result
 
