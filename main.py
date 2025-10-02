@@ -73,7 +73,7 @@ def fred_series(id: str = "CPIAUCSL"):
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id={id}&api_key={FRED_API_KEY}&file_type=json"
     return requests.get(url).json()
 
-# ============== Treasury (使用 FRED 代理国债收益率) ==============
+# ============== Treasury (FRED 国债收益率) ==============
 @app.get("/treasury/yield")
 def treasury_yield():
     tickers = {"2Y": "DGS2", "10Y": "DGS10", "30Y": "DGS30"}
@@ -85,28 +85,43 @@ def treasury_yield():
             result[k] = data["observations"][0]
     return {"source": "FRED", "yields": result}
 
-# ============== ETF (Yahoo Finance) ==============
+# ============== ETF (Yahoo 基本信息 + FMP v4 持仓) ==============
 @app.get("/etf")
 def etf_info(ticker: str = "SPY"):
-    etf = yf.Ticker(ticker)
-    info = etf.info
-    holdings = []
+    result = {"ticker": ticker, "source": "Yahoo+FMP"}
+
+    # --- 基本信息（Yahoo Finance） ---
     try:
-        if "holdings" in dir(etf) and etf.holdings is not None:
-            holdings = etf.holdings.to_dict("records")
-    except Exception:
-        pass
-    return {
-        "source": "yahoo_finance",
-        "ticker": ticker,
-        "category": info.get("category"),
-        "family": info.get("fundFamily"),
-        "styleBox": info.get("styleBox"),
-        "top_holdings": holdings[:10] if holdings else []
-    }
+        etf = yf.Ticker(ticker)
+        info = etf.info
+        result.update({
+            "category": info.get("category"),
+            "family": info.get("fundFamily"),
+            "styleBox": info.get("styleBox")
+        })
+    except Exception as e:
+        result["yahoo_error"] = str(e)
+
+    # --- 持仓数据（FMP v4） ---
+    try:
+        url = f"https://financialmodelingprep.com/api/v4/etf-holdings/{ticker}?apikey={FMP_API_KEY}"
+        resp = requests.get(url).json()
+        holdings = []
+        if isinstance(resp, list) and resp:
+            for h in resp[:10]:  # Top 10
+                holdings.append({
+                    "symbol": h.get("asset"),
+                    "name": h.get("name"),
+                    "weight": h.get("weightPercentage")
+                })
+        result["top_holdings"] = holdings
+    except Exception as e:
+        result["fmp_error"] = str(e)
+
+    return result
 
 # ============== NewsAPI ==============
 @app.get("/newsapi")
-def get_news(query: str = "apple"):
+def get_news(query: str = "Apple"):
     url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
     return requests.get(url).json()
