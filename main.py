@@ -1,8 +1,6 @@
 from fastapi import FastAPI
 import requests
 import os
-import csv
-import io
 
 app = FastAPI()
 
@@ -14,8 +12,6 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-ETF_SOURCE = os.getenv("ETF_SOURCE", "yahoo_finance")
-TREASURY_API = os.getenv("TREASURY_API", "public")
 
 # ============== 根路径健康检查 ==============
 @app.get("/")
@@ -74,33 +70,30 @@ def fred_series(id: str):
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id={id}&api_key={FRED_API_KEY}&file_type=json"
     return requests.get(url).json()
 
-# ============== Treasury ==============
+# ============== Treasury (用 FRED 数据) ==============
 @app.get("/treasury/yield")
 def treasury_yield():
     """
-    从 Treasury.gov 官方 CSV API 获取每日收益率曲线，转换为 JSON
+    从 FRED API 获取国债收益率 (2Y, 10Y, 30Y)，返回最近30天
     """
-    if TREASURY_API == "public":
-        url = "https://home.treasury.gov/sites/default/files/interest-rates/yield.csv"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True).text
+    series = {"2Y": "DGS2", "10Y": "DGS10", "30Y": "DGS30"}
+    results = {}
 
-        reader = csv.DictReader(io.StringIO(resp))
-        data = list(reader)
+    for label, sid in series.items():
+        url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={FRED_API_KEY}&file_type=json"
+        resp = requests.get(url).json()
+        obs = resp.get("observations", [])
+        # 取最近 30 天
+        latest30 = obs[-30:] if len(obs) > 30 else obs
+        results[label] = latest30
 
-        return {
-            "source": "treasury.gov",
-            "count": len(data),
-            "latest": data[-1] if data else None,
-            "data": data[-30:] if data else []
-        }
-    else:
-        return {"error": f"Treasury API mode {TREASURY_API} not implemented"}
+    return {"source": "FRED", "yields": results}
 
 # ============== ETF (Yahoo Finance) ==============
 @app.get("/etf")
 def etf_data(ticker: str):
     """
-    从 Yahoo Finance 获取 ETF 信息 (基金规模 + Top Holdings)
+    从 Yahoo Finance 获取 ETF 信息 (基金类别 + Top Holdings)
     """
     url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=topHoldings,fundProfile"
     resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -108,6 +101,7 @@ def etf_data(ticker: str):
 
     result = {"source": "yahoo_finance", "ticker": ticker}
 
+    # 基金基本信息
     try:
         fund_profile = data["quoteSummary"]["result"][0]["fundProfile"]
         result["category"] = fund_profile.get("category", None)
@@ -118,6 +112,7 @@ def etf_data(ticker: str):
         result["family"] = None
         result["styleBox"] = None
 
+    # Top 10 持仓
     try:
         holdings = data["quoteSummary"]["result"][0]["topHoldings"]["holdings"]
         top10 = [
