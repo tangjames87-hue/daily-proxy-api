@@ -12,6 +12,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
 
 # ============== 根路径健康检查 ==============
 @app.get("/")
@@ -83,43 +84,30 @@ def treasury_yield():
         url = f"https://api.stlouisfed.org/fred/series/observations?series_id={sid}&api_key={FRED_API_KEY}&file_type=json"
         resp = requests.get(url).json()
         obs = resp.get("observations", [])
-        # 取最近 30 天
         latest30 = obs[-30:] if len(obs) > 30 else obs
         results[label] = latest30
 
     return {"source": "FRED", "yields": results}
 
-# ============== ETF (Yahoo Finance) ==============
+# ============== ETF (FMP API) ==============
 @app.get("/etf")
 def etf_data(ticker: str):
     """
-    从 Yahoo Finance 获取 ETF 信息 (基金类别 + Top Holdings)
+    从 FMP 获取 ETF 持仓 (Top10)
     """
-    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=topHoldings,fundProfile"
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    url = f"https://financialmodelingprep.com/api/v3/etf-holdings/{ticker}?apikey={FMP_API_KEY}"
+    resp = requests.get(url)
     data = resp.json()
 
-    result = {"source": "yahoo_finance", "ticker": ticker}
+    result = {"source": "FMP", "ticker": ticker}
 
-    # 基金基本信息
     try:
-        fund_profile = data["quoteSummary"]["result"][0]["fundProfile"]
-        result["category"] = fund_profile.get("category", None)
-        result["family"] = fund_profile.get("family", None)
-        result["styleBox"] = fund_profile.get("styleBoxUrl", None)
-    except:
-        result["category"] = None
-        result["family"] = None
-        result["styleBox"] = None
-
-    # Top 10 持仓
-    try:
-        holdings = data["quoteSummary"]["result"][0]["topHoldings"]["holdings"]
+        holdings = data.get("holdings", [])
         top10 = [
             {
-                "name": h.get("holdingName"),
-                "symbol": h.get("symbol"),
-                "weight": h.get("holdingPercent")
+                "name": h.get("asset", None),
+                "symbol": h.get("symbol", None),
+                "weight": h.get("weightPercentage", None)
             }
             for h in holdings[:10]
         ]
