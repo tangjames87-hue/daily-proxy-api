@@ -3,7 +3,6 @@ import requests
 import os
 import csv
 import io
-from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -15,7 +14,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-ETF_SOURCE = os.getenv("ETF_SOURCE", "etfdb_free")
+ETF_SOURCE = os.getenv("ETF_SOURCE", "yahoo_finance")
 TREASURY_API = os.getenv("TREASURY_API", "public")
 
 # ============== 根路径健康检查 ==============
@@ -79,11 +78,11 @@ def fred_series(id: str):
 @app.get("/treasury/yield")
 def treasury_yield():
     """
-    从 Treasury.gov 抓取每日收益率曲线，并解析为 JSON
+    从 Treasury.gov 官方 CSV API 获取每日收益率曲线，转换为 JSON
     """
     if TREASURY_API == "public":
-        url = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-yield-curve-rates.csv"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
+        url = "https://home.treasury.gov/sites/default/files/interest-rates/yield.csv"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True).text
 
         reader = csv.DictReader(io.StringIO(resp))
         data = list(reader)
@@ -92,52 +91,48 @@ def treasury_yield():
             "source": "treasury.gov",
             "count": len(data),
             "latest": data[-1] if data else None,
-            "data": data[:30]
+            "data": data[-30:] if data else []
         }
     else:
         return {"error": f"Treasury API mode {TREASURY_API} not implemented"}
 
-# ============== ETF Source ==============
-@app.get("/etfdb")
+# ============== ETF (Yahoo Finance) ==============
+@app.get("/etf")
 def etf_data(ticker: str):
     """
-    从 etfdb.com 抓取 ETF 页面，解析基金规模、持仓 Top10
+    从 Yahoo Finance 获取 ETF 信息 (基金规模 + Top Holdings)
     """
-    if ETF_SOURCE == "etfdb_free":
-        url = f"https://etfdb.com/etf/{ticker}/"
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-        soup = BeautifulSoup(html, "html.parser")
+    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=topHoldings,fundProfile"
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    data = resp.json()
 
-        result = {"source": "etfdb", "ticker": ticker}
+    result = {"source": "yahoo_finance", "ticker": ticker}
 
-        # 基金规模
-        try:
-            asset_tag = soup.find(text="Assets Under Management").find_next("div")
-            result["assets"] = asset_tag.text.strip()
-        except:
-            try:
-                asset_tag = soup.find("div", class_="fund__data").find("span")
-                result["assets"] = asset_tag.text.strip()
-            except:
-                result["assets"] = None
+    try:
+        fund_profile = data["quoteSummary"]["result"][0]["fundProfile"]
+        result["category"] = fund_profile.get("category", None)
+        result["family"] = fund_profile.get("family", None)
+        result["styleBox"] = fund_profile.get("styleBoxUrl", None)
+    except:
+        result["category"] = None
+        result["family"] = None
+        result["styleBox"] = None
 
-        # Top 10 持仓
-        holdings = []
-        try:
-            holdings_table = soup.find("table", {"class": "table-etf-holdings"})
-            if holdings_table:
-                rows = holdings_table.find_all("tr")[1:11]
-                for r in rows:
-                    cols = [c.get_text(strip=True) for c in r.find_all("td")]
-                    if cols:
-                        holdings.append({"name": cols[0], "weight": cols[-1]})
-        except:
-            pass
+    try:
+        holdings = data["quoteSummary"]["result"][0]["topHoldings"]["holdings"]
+        top10 = [
+            {
+                "name": h.get("holdingName"),
+                "symbol": h.get("symbol"),
+                "weight": h.get("holdingPercent")
+            }
+            for h in holdings[:10]
+        ]
+        result["top_holdings"] = top10
+    except:
+        result["top_holdings"] = []
 
-        result["top_holdings"] = holdings
-        return result
-    else:
-        return {"error": f"ETF source mode {ETF_SOURCE} not implemented"}
+    return result
 
 # ============== NewsAPI ==============
 @app.get("/newsapi")
