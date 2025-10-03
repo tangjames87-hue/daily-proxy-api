@@ -6,11 +6,11 @@ from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
-import math
 import requests
+import yfinance as yf
 
 # ================== FastAPI ==================
-app = FastAPI(title="Daily Proxy API", version="1.0.0")
+app = FastAPI(title="Daily Proxy API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,11 +26,8 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")  # 备用，不强制用
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-
 BASE_URL = os.getenv("BASE_URL", "https://daily-proxy-api.onrender.com")
-
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 
 # ================== 轻量缓存（TTL） ==================
@@ -46,7 +43,7 @@ def cache_get(key: str, ttl: int) -> Optional[Any]:
 def cache_set(key: str, data: Any):
     _cache[key] = {"ts": time.time(), "data": data}
 
-# ================== 小工具 ==================
+# ================== 工具 ==================
 def now_ts() -> int:
     return int(datetime.utcnow().timestamp())
 
@@ -55,11 +52,6 @@ def today_str() -> str:
 
 def n_days_ago_str(n: int) -> str:
     return (date.today() - timedelta(days=n)).isoformat()
-
-def parse_bool(v: Optional[str], default=False) -> bool:
-    if v is None:
-        return default
-    return str(v).lower() in ["1", "true", "t", "yes", "y"]
 
 def http_get_json(url: str, timeout: int = HTTP_TIMEOUT, raise_for_status=False) -> Any:
     r = requests.get(url, timeout=timeout)
@@ -83,7 +75,6 @@ def finnhub_quote(symbol: str) -> Optional[Dict[str, Any]]:
     js = http_get_json(url)
     if not isinstance(js, dict):
         return None
-    # Finnhub 自带 d/dp（相对前收）；没有 t，这里补当前时间戳
     out = {
         "symbol": symbol.upper(),
         "c": js.get("c"), "h": js.get("h"), "l": js.get("l"),
@@ -117,7 +108,6 @@ def finnhub_company_news(symbol: str, days: int = 30) -> List[Dict[str, Any]]:
     url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={_from}&to={_to}&token={FINNHUB_API_KEY}"
     js = http_get_json(url)
     out = js if isinstance(js, list) else []
-    # 截取前 10 条
     out = out[:10]
     cache_set(key, out)
     return out
@@ -143,7 +133,6 @@ def fred_latest(series_id: str) -> Optional[Dict[str, Any]]:
     return out
 
 def fmp_etf_holdings(etf: str) -> Any:
-    """ETF 持仓（FMP）"""
     if not FMP_API_KEY:
         return None
     key = f"fmp_etf:{etf}"
@@ -163,6 +152,20 @@ def finnhub_candles(symbol: str, res: str, start_ts: int, end_ts: int) -> Option
     if isinstance(js, dict) and js.get("s") == "ok":
         return js
     return None
+
+def yf_download(symbol: str, period: str = "60d", interval: str = "1d"):
+    """yfinance 回退，返回与 Finnhub 类似的结构"""
+    try:
+        df = yf.download(symbol, period=period, interval=interval, progress=False, prepost=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        df = df.dropna()
+        o = df["Open"].tolist(); h = df["High"].tolist(); l = df["Low"].tolist()
+        c = df["Close"].tolist(); v = df["Volume"].tolist()
+        t = [int(ts.timestamp()) for ts in df.index.to_pydatetime()]
+        return {"s": "ok", "o": o, "h": h, "l": l, "c": c, "v": v, "t": t}
+    except Exception:
+        return None
 
 def fmp_macro_calendar(frm: str, to: str) -> List[Dict[str, Any]]:
     if not FMP_API_KEY:
@@ -222,7 +225,15 @@ def root():
 
 @app.get("/healthcheck")
 def healthcheck():
-    return {"status": "running", "time_utc": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "status": "running",
+        "time_utc": datetime.utcnow().isoformat() + "Z",
+        "keys": {
+            "FINNHUB": bool(FINNHUB_API_KEY),
+            "FRED": bool(FRED_API_KEY),
+            "FMP": bool(FMP_API_KEY),
+        }
+    }
 
 # ================== 行情：/price /prices ==================
 @app.get("/price")
@@ -238,7 +249,6 @@ def prices(symbols: str = Query(..., description="逗号分隔，如 AAPL,TSLA,S
     out: Dict[str, Any] = {}
     if not syms:
         return out
-    # 并发拉取
     with ThreadPoolExecutor(max_workers=min(8, len(syms))) as ex:
         futs = {ex.submit(finnhub_quote, s): s for s in syms}
         for fut in as_completed(futs):
@@ -252,37 +262,22 @@ def prices(symbols: str = Query(..., description="逗号分隔，如 AAPL,TSLA,S
 def analyze(ticker: str = "AAPL", etf: str = "SPY",
             include_account: Optional[str] = None,
             include_etf_holdings: Optional[str] = "false"):
-    """
-    返回：
-    - price: Finnhub quote
-    - company: Finnhub profile2
-    - news: 近 30 天公司新闻
-    - macro: 可选宏观（示例：CPI）
-    - treasury: 2Y/5Y/10Y/30Y 最新观察值（FRED）
-    - etf: ETF 持仓（FMP，开关）
-    - account/positions/orders: Alpaca（开关）
-    """
     result: Dict[str, Any] = {"ticker": ticker.upper()}
-
-    # 行情
     try:
         result["price"] = finnhub_quote(ticker)
     except Exception as e:
         result["price_error"] = str(e)
 
-    # 公司信息
     try:
         result["company"] = finnhub_profile(ticker)
     except Exception as e:
         result["company_error"] = str(e)
 
-    # 公司新闻（近 30 天）
     try:
         result["news"] = finnhub_company_news(ticker, days=30)
     except Exception as e:
         result["news_error"] = str(e)
 
-    # 宏观示例（CPI）
     try:
         if FRED_API_KEY:
             url = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1"
@@ -290,7 +285,6 @@ def analyze(ticker: str = "AAPL", etf: str = "SPY",
     except Exception as e:
         result["macro_error"] = str(e)
 
-    # 国债收益率
     try:
         yields = {}
         for k, sid in {"US2Y": "DGS2", "US5Y": "DGS5", "US10Y": "DGS10", "US30Y": "DGS30"}.items():
@@ -301,16 +295,14 @@ def analyze(ticker: str = "AAPL", etf: str = "SPY",
     except Exception as e:
         result["treasury_error"] = str(e)
 
-    # ETF 持仓（可选）
     try:
-        if parse_bool(include_etf_holdings, default=False):
+        if include_etf_holdings and include_etf_holdings.lower() in ("1","true","yes","y"):
             result["etf"] = fmp_etf_holdings(etf)
     except Exception as e:
         result["etf_error"] = str(e)
 
-    # Alpaca 模拟账户（可选）
     try:
-        if parse_bool(include_account, default=False) and ALPACA_API_KEY and ALPACA_SECRET_KEY:
+        if include_account and include_account.lower() in ("1","true","yes","y") and ALPACA_API_KEY and ALPACA_SECRET_KEY:
             headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
             account = http_get_json(f"{ALPACA_BASE_URL}/v2/account")
             positions = http_get_json(f"{ALPACA_BASE_URL}/v2/positions")
@@ -328,9 +320,6 @@ def analyze(ticker: str = "AAPL", etf: str = "SPY",
 def proxy(symbol: str = Query(..., description="股票代码"), etf: str = "SPY",
           include_account: Optional[str] = None,
           include_etf_holdings: Optional[str] = "false"):
-    """
-    兼容前端：内部调用 /analyze 返回 JSON
-    """
     try:
         url = f"{BASE_URL}/analyze?ticker={symbol}&etf={etf}&include_account={include_account}&include_etf_holdings={include_etf_holdings}"
         resp = requests.get(url, timeout=HTTP_TIMEOUT)
@@ -341,29 +330,21 @@ def proxy(symbol: str = Query(..., description="股票代码"), etf: str = "SPY"
 # ================== 市场聚合：/market ==================
 @app.get("/market")
 def market():
-    """
-    返回：
-    - indices: 以 ETF 代理的指数价差（SPY/QQQ/DIA）
-    - yields: FRED 真实国债收益率（US2Y/5Y/10Y/30Y）
-    - etfs.snapshot: 核心 ETF 的快照（price 字段为 /price 形状）
-    - news_top: 来自 SPY/QQQ 的头条若干
-    """
     out: Dict[str, Any] = {"indices": {}, "yields": {}, "etfs": {"snapshot": {}}, "news_top": [], "extras": {}}
     core_indices = {"SPX_proxy_SPY": "SPY", "NDX_proxy_QQQ": "QQQ", "DJI_proxy_DIA": "DIA"}
     core_etfs = ["SPY","QQQ","VTI","IWM","DIA","TLT","IEF","HYG","LQD"]
 
-    # 指数代理 + ETF 快照
+    # 用 HTTP 自调用 /prices，避免在路由函数内直接互调
     try:
-        # 批量一次取完
-        quotes = prices(",".join(list(set(list(core_indices.values()) + core_etfs))))
-        # indices
+        sym_list = ",".join(sorted(set(list(core_indices.values()) + core_etfs)))
+        quotes = http_get_json(f"{BASE_URL}/prices?symbols={sym_list}") or {}
         for k, sym in core_indices.items():
-            q = quotes.get(sym) if isinstance(quotes, dict) else None
-            out["indices"][k] = q
-        # snapshot
+            q = quotes.get(sym)
+            if q:
+                out["indices"][k] = q
         snap = {}
         for sym in core_etfs:
-            q = quotes.get(sym) if isinstance(quotes, dict) else None
+            q = quotes.get(sym)
             if q:
                 snap[sym] = {"price": q}
         out["etfs"]["snapshot"] = snap
@@ -379,7 +360,7 @@ def market():
     except Exception as e:
         out["yields_error"] = str(e)
 
-    # 头条（SPY/QQQ 取各 2 条）
+    # 头条（SPY/QQQ 各 2 条）
     try:
         for sym in ["SPY","QQQ"]:
             arr = finnhub_company_news(sym, days=7)
@@ -410,8 +391,10 @@ def candles(symbol: str, intraday_res: str = "5", days: int = 40):
     end_ts = int(now.timestamp())
     start_daily = int((now - timedelta(days=max(days, 40) + 5)).timestamp())
 
-    # 日线
+    # 日线：Finnhub -> yfinance 回退
     daily = finnhub_candles(symbol, "D", start_daily, end_ts)
+    if not daily:
+        daily = yf_download(symbol, period=f"{max(days,40)+5}d", interval="1d")
     if daily:
         c = daily.get("c", []) or []
         h = daily.get("h", []) or []
@@ -427,9 +410,13 @@ def candles(symbol: str, intraday_res: str = "5", days: int = 40):
             "avg_vol20": sma(v, 20),
         }
 
-    # 当日
+    # 当日：Finnhub -> yfinance 回退（yfinance 5m 需要 period >= 7d）
     start_intraday = int(datetime(now.year, now.month, now.day).timestamp())
     intra = finnhub_candles(symbol, intraday_res, start_intraday, end_ts)
+    if not intra:
+        interval = f"{intraday_res}m" if intraday_res.isdigit() else "5m"
+        yfintra = yf_download(symbol, period="7d", interval=interval)
+        intra = yfintra
     if intra:
         h = intra.get("h", []) or []
         l = intra.get("l", []) or []
@@ -465,7 +452,6 @@ def events(symbols: str = "", days: int = 14):
     to = today + timedelta(days=days)
     out: Dict[str, Any] = {"earnings": {}, "macro": []}
 
-    # earnings（Finnhub）
     try:
         if FINNHUB_API_KEY:
             from_str = today.isoformat(); to_str = to.isoformat()
@@ -487,7 +473,6 @@ def events(symbols: str = "", days: int = 14):
     except Exception:
         out["earnings"] = {}
 
-    # macro（FMP）
     try:
         out["macro"] = fmp_macro_calendar(today.isoformat(), to.isoformat())
     except Exception:
@@ -496,7 +481,7 @@ def events(symbols: str = "", days: int = 14):
     out["server_time_utc"] = datetime.utcnow().isoformat() + "Z"
     return out
 
-# ================== 本地开发入口（Render 会忽略） ==================
+# ================== 本地开发入口 ==================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
