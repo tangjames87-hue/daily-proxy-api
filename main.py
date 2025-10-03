@@ -1,476 +1,427 @@
 # main.py
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-import time
 import requests
-import yfinance as yf
+import pandas as pd
+from datetime import datetime, timedelta, timezone
 
-# ================== FastAPI ==================
-app = FastAPI(title="Daily Proxy API", version="1.3.0")
+# -------------------- 环境变量 --------------------
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+FMP_API_KEY     = os.getenv("FMP_API_KEY", "")
+FRED_API_KEY    = os.getenv("FRED_API_KEY", "")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # 允许前端跨域
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 用于 /proxy 自调用（Render 的外网域名）
+BASE_URL = os.getenv("BASE_URL", "https://daily-proxy-api.onrender.com")
 
-# ================== ENV ==================
-FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
-ALPACA_API_KEY   = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY= os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL  = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-FRED_API_KEY     = os.getenv("FRED_API_KEY", "")
-FMP_API_KEY      = os.getenv("FMP_API_KEY", "")
-BASE_URL         = os.getenv("BASE_URL", "https://daily-proxy-api.onrender.com")
-HTTP_TIMEOUT     = int(os.getenv("HTTP_TIMEOUT", "15"))
+app = FastAPI(title="Daily Proxy API", version="2025-10-03")
 
-# ================== 轻量 TTL 缓存 ==================
-_cache: Dict[str, Dict[str, Any]] = {}
-def cache_get(key: str, ttl: int) -> Optional[Any]:
-    it = _cache.get(key)
-    if not it: return None
-    if time.time() - it["ts"] > ttl: return None
-    return it["data"]
+# -------------------- 小工具 --------------------
+def now_utc_str():
+    return datetime.utcnow().isoformat() + "Z"
 
-def cache_set(key: str, data: Any):
-    _cache[key] = {"ts": time.time(), "data": data}
-
-# ================== Utils ==================
-def now_ts() -> int: return int(datetime.utcnow().timestamp())
-def today_str() -> str: return date.today().isoformat()
-def n_days_ago_str(n: int) -> str: return (date.today() - timedelta(days=n)).isoformat()
-
-def http_get_json(url: str, timeout: int = HTTP_TIMEOUT, raise_for_status: bool = False) -> Any:
+def http_json(url: str, timeout: int = 20):
     r = requests.get(url, timeout=timeout)
-    if raise_for_status: r.raise_for_status()
-    try: return r.json()
-    except Exception: return None
+    r.raise_for_status()
+    return r.json()
 
-# ================== 第三方封装（Finnhub/FMP/yfinance） ==================
-def finnhub_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    if not FINNHUB_API_KEY: return None
-    key = f"fh_q:{symbol}"
-    c = cache_get(key, ttl=8)
-    if c: return c
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-    js = http_get_json(url)
-    if not isinstance(js, dict): return None
-    out = {
-        "symbol": symbol.upper(),
-        "c": js.get("c"), "h": js.get("h"), "l": js.get("l"),
-        "o": js.get("o"), "pc": js.get("pc"),
-        "d": js.get("d"), "dp": js.get("dp"), "t": now_ts(),
-    }
-    cache_set(key, out)
-    return out
-
-def finnhub_profile(symbol: str) -> Optional[Dict[str, Any]]:
-    if not FINNHUB_API_KEY: return None
-    key = f"fh_pf:{symbol}"
-    c = cache_get(key, ttl=3600)
-    if c: return c
-    url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_API_KEY}"
-    js = http_get_json(url)
-    cache_set(key, js)
-    return js
-
-def finnhub_company_news(symbol: str, days: int = 30) -> List[Dict[str, Any]]:
-    if not FINNHUB_API_KEY: return []
-    key = f"fh_news:{symbol}:{days}"
-    c = cache_get(key, ttl=300)
-    if c: return c
-    _from, _to = n_days_ago_str(days), today_str()
-    url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={_from}&to={_to}&token={FINNHUB_API_KEY}"
-    js = http_get_json(url)
-    out = js if isinstance(js, list) else []
-    out = out[:10]
-    cache_set(key, out)
-    return out
-
-def finnhub_candles(symbol: str, res: str, start_ts: int, end_ts: int) -> Optional[Dict[str, Any]]:
-    if not FINNHUB_API_KEY: return None
-    url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution={res}&from={start_ts}&to={end_ts}&token={FINNHUB_API_KEY}"
-    js = http_get_json(url)
-    if isinstance(js, dict) and js.get("s") == "ok": return js
-    return None
-
-def fred_latest(series_id: str) -> Optional[Dict[str, Any]]:
-    if not FRED_API_KEY: return None
-    key = f"fred:{series_id}"
-    c = cache_get(key, ttl=600)
-    if c: return c
-    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1"
-    js = http_get_json(url)
-    obs = None
-    try: obs = (js or {}).get("observations", [])[0]
-    except Exception: obs = None
-    if not obs: return None
-    out = {"series": series_id, "date": obs.get("date"), "value": obs.get("value")}
-    cache_set(key, out)
-    return out
-
-def fmp_etf_holdings(etf: str) -> Any:
-    if not FMP_API_KEY: return None
-    key = f"fmp_etf:{etf}"
-    c = cache_get(key, ttl=3600)
-    if c: return c
-    url = f"https://financialmodelingprep.com/api/v4/etf-holdings/{etf}?apikey={FMP_API_KEY}"
-    js = http_get_json(url)
-    cache_set(key, js)
-    return js
-
-# ---- FMP K 线回退 ----
-def fmp_daily(symbol: str, limit: int = 120):
-    if not FMP_API_KEY: return None
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries={limit}&apikey={FMP_API_KEY}"
-    js = http_get_json(url)
-    hist = (js or {}).get("historical") or []
-    if not hist: return None
-    hist = list(reversed(hist))   # 最早->最近
-    o = [x.get("open") for x in hist]
-    h = [x.get("high") for x in hist]
-    l = [x.get("low") for x in hist]
-    c = [x.get("close") for x in hist]
-    v = [x.get("volume") for x in hist]
-    t = []
-    for x in hist:
-        dt = x.get("date")
-        try:
-            t.append(int(datetime.fromisoformat(dt).timestamp()))
-        except Exception:
-            t.append(int(datetime.utcnow().timestamp()))
-    if len(t) != len(c):
-        base = datetime.utcnow() - timedelta(days=len(c))
-        t = [int((base + timedelta(days=i)).timestamp()) for i in range(len(c))]
-    return {"s":"ok","o":o,"h":h,"l":l,"c":c,"v":v,"t":t}
-
-def fmp_intraday(symbol: str, interval: str = "5min", limit: int = 300):
-    if not FMP_API_KEY: return None
-    url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}?apikey={FMP_API_KEY}"
-    arr = http_get_json(url)
-    if not isinstance(arr, list) or not arr: return None
-    arr = list(reversed(arr))[-limit:]
-    o = [x.get("open") for x in arr]
-    h = [x.get("high") for x in arr]
-    l = [x.get("low") for x in arr]
-    c = [x.get("close") for x in arr]
-    v = [x.get("volume") for x in arr]
-    t = []
-    for x in arr:
-        dt = x.get("date")  # "YYYY-MM-DD HH:MM:SS"
-        try: t.append(int(datetime.fromisoformat(dt).timestamp()))
-        except Exception: t.append(int(datetime.utcnow().timestamp()))
-    return {"s":"ok","o":o,"h":h,"l":l,"c":c,"v":v,"t":t}
-
-# ---- yfinance 帮助函数 ----
-def yf_history(symbol: str, period: str, interval: str):
+def safe_round(x, p=4):
     try:
-        t = yf.Ticker(symbol)
-        df = t.history(period=period, interval=interval, auto_adjust=False, prepost=False)
-        if df is None or df.empty:
-            df = yf.download(symbol, period=period, interval=interval, progress=False, prepost=False, auto_adjust=False)
-        if df is None or df.empty:
-            return None
-        df = df.dropna()
-        o = df["Open"].tolist(); h = df["High"].tolist(); l = df["Low"].tolist()
-        c = df["Close"].tolist(); v = df["Volume"].tolist()
-        tlist = [int(ts.timestamp()) for ts in df.index.to_pydatetime()]
-        return {"s":"ok","o":o,"h":h,"l":l,"c":c,"v":v,"t":tlist}
+        return round(float(x), p)
     except Exception:
-        return None
+        return x
 
-# ================== 指标 ==================
-def sma(values: List[float], n: int) -> Optional[float]:
-    if not values or len(values) < n: return None
-    return sum(values[-n:]) / n
-
-def atr14_from_daily(h: List[float], l: List[float], c: List[float]) -> Optional[float]:
-    n = len(c)
-    if n < 15: return None
-    trs = []; prev_close = c[0]
-    for i in range(1, n):
-        tr = max(h[i]-l[i], abs(h[i]-prev_close), abs(l[i]-prev_close))
-        trs.append(tr); prev_close = c[i]
-    if len(trs) < 14: return None
-    return sum(trs[-14:]) / 14
-
-def vwap_from_intraday(h: List[float], l: List[float], c: List[float], v: List[float]) -> Optional[float]:
-    if not h or not v or len(h) != len(v): return None
-    tv = 0.0; tpv = 0.0
-    for i in range(len(v)):
-        tp = (h[i] + l[i] + c[i]) / 3.0
-        vol = v[i]; tv += vol; tpv += tp * vol
-    return (tpv / tv) if tv > 0 else None
-
-# ================== 根 & 健康检查 ==================
+# -------------------- 基础/健康 --------------------
 @app.get("/")
 def root():
-    return {"status":"ok","message":"Daily Proxy API is running!","time_utc":datetime.utcnow().isoformat()+"Z"}
+    return {"status": "ok", "message": "Daily Proxy API is running!", "time_utc": now_utc_str()}
 
 @app.get("/healthcheck")
 def healthcheck():
-    return {
-        "status":"running",
-        "time_utc":datetime.utcnow().isoformat()+"Z",
-        "keys":{"FINNHUB":bool(FINNHUB_API_KEY),"FRED":bool(FRED_API_KEY),"FMP":bool(FMP_API_KEY)}
+    keys = {
+        "FINNHUB": bool(FINNHUB_API_KEY),
+        "FRED":    bool(FRED_API_KEY),
+        "FMP":     bool(FMP_API_KEY),
     }
+    return {"status": "running", "time_utc": now_utc_str(), "keys": keys}
 
-# ================== /price /prices ==================
-@app.get("/price")
-def price(symbol: str = Query(..., description="股票代码，如 TSLA")):
-    q = finnhub_quote(symbol)
-    return q if q else {"symbol":symbol.upper(),"error":"quote_unavailable"}
-
-@app.get("/prices")
-def prices(symbols: str = Query(..., description="逗号分隔，如 AAPL,TSLA,SPY")):
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    out: Dict[str, Any] = {}
-    if not syms: return out
-    with ThreadPoolExecutor(max_workers=min(8, len(syms))) as ex:
-        futs = {ex.submit(finnhub_quote, s): s for s in syms}
-        for fut in as_completed(futs):
-            s = futs[fut]; q = fut.result()
-            out[s] = q if q else {"symbol": s, "error":"quote_unavailable"}
+# -------------------- 报价 --------------------
+def finnhub_quote(symbol: str):
+    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+    try:
+        j = http_json(url, timeout=15)
+    except Exception as e:
+        return {"symbol": symbol.upper(), "error": str(e)}
+    # Finnhub: c/h/l/o/pc/d/dp/t
+    out = {
+        "symbol": symbol.upper(),
+        "c": j.get("c"),
+        "h": j.get("h"),
+        "l": j.get("l"),
+        "o": j.get("o"),
+        "pc": j.get("pc"),
+        "d": j.get("d"),
+        "dp": j.get("dp"),
+        "t": j.get("t"),
+    }
     return out
 
-# ================== /analyze /proxy ==================
+@app.get("/price")
+def price(symbol: str = Query(..., description="Ticker")):
+    return finnhub_quote(symbol)
+
+@app.get("/prices")
+def prices(symbols: str = Query(..., description="逗号分隔：AAPL,TSLA,SPY")):
+    out = {}
+    for s in [x.strip().upper() for x in symbols.split(",") if x.strip()]:
+        out[s] = finnhub_quote(s)
+    return out
+
+# -------------------- 个股聚合 --------------------
 @app.get("/analyze")
-def analyze(ticker: str = "AAPL", etf: str = "SPY",
-            include_account: Optional[str] = None,
-            include_etf_holdings: Optional[str] = "false"):
-    result: Dict[str, Any] = {"ticker": ticker.upper()}
+def analyze(ticker: str = "AAPL", etf: str = "SPY"):
+    result = {"ticker": ticker.upper()}
 
-    try: result["price"] = finnhub_quote(ticker)
-    except Exception as e: result["price_error"] = str(e)
-
-    try: result["company"] = finnhub_profile(ticker)
-    except Exception as e: result["company_error"] = str(e)
-
-    try: result["news"] = finnhub_company_news(ticker, days=30)
-    except Exception as e: result["news_error"] = str(e)
-
+    # --- 股票行情 ---
     try:
-        if FRED_API_KEY:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1"
-            result["macro"] = http_get_json(url)
-    except Exception as e: result["macro_error"] = str(e)
+        result["price"] = finnhub_quote(ticker)
+    except Exception as e:
+        result["price_error"] = str(e)
 
+    # --- 公司信息 ---
     try:
+        url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_API_KEY}"
+        result["company"] = http_json(url, timeout=15)
+    except Exception as e:
+        result["company_error"] = str(e)
+
+    # --- 公司新闻（近 30 天）---
+    try:
+        to_dt = datetime.utcnow().date()
+        from_dt = to_dt - timedelta(days=30)
+        url = (f"https://finnhub.io/api/v1/company-news"
+               f"?symbol={ticker}&from={from_dt.isoformat()}&to={to_dt.isoformat()}&token={FINNHUB_API_KEY}")
+        result["news"] = http_json(url, timeout=20)
+    except Exception as e:
+        result["news_error"] = str(e)
+
+    # --- 宏观：CPI 最新值 ---
+    try:
+        url = (f"https://api.stlouisfed.org/fred/series/observations?"
+               f"series_id=CPIAUCSL&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1")
+        result["macro"] = http_json(url, timeout=20)
+    except Exception as e:
+        result["macro_error"] = str(e)
+
+    # --- 国债收益率（2/5/10/30Y）---
+    try:
+        series = {"US2Y": "DGS2", "US5Y": "DGS5", "US10Y": "DGS10", "US30Y": "DGS30"}
         yields = {}
-        for k, sid in {"US2Y":"DGS2","US5Y":"DGS5","US10Y":"DGS10","US30Y":"DGS30"}.items():
-            obs = fred_latest(sid)
-            if obs: yields[k] = obs
+        for k, sid in series.items():
+            url = (f"https://api.stlouisfed.org/fred/series/observations?"
+                   f"series_id={sid}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1")
+            d = http_json(url, timeout=15)
+            obs = (d.get("observations") or [])
+            if obs:
+                yields[k] = {"series": sid, "date": obs[0]["date"], "value": obs[0]["value"]}
         result["treasury"] = yields
-    except Exception as e: result["treasury_error"] = str(e)
+    except Exception as e:
+        result["treasury_error"] = str(e)
 
+    # --- ETF 持仓（可选：需要 FMP Key）---
     try:
-        if include_etf_holdings and include_etf_holdings.lower() in ("1","true","yes","y"):
-            result["etf"] = fmp_etf_holdings(etf)
-    except Exception as e: result["etf_error"] = str(e)
+        if FMP_API_KEY and etf:
+            url = f"https://financialmodelingprep.com/api/v4/etf-holdings/{etf}?apikey={FMP_API_KEY}"
+            result["etf"] = http_json(url, timeout=20)
+    except Exception as e:
+        result["etf_error"] = str(e)
 
-    try:
-        if include_account and include_account.lower() in ("1","true","yes","y") and ALPACA_API_KEY and ALPACA_SECRET_KEY:
-            account   = http_get_json(f"{ALPACA_BASE_URL}/v2/account")
-            positions = http_get_json(f"{ALPACA_BASE_URL}/v2/positions")
-            orders    = http_get_json(f"{ALPACA_BASE_URL}/v2/orders")
-            result["account"], result["positions"], result["orders"] = account, positions, orders
-    except Exception as e: result["alpaca_error"] = str(e)
-
-    result["server_time_utc"] = datetime.utcnow().isoformat()+"Z"
+    result["server_time_utc"] = now_utc_str()
     return result
 
 @app.get("/proxy")
-def proxy(symbol: str = Query(..., description="股票代码"), etf: str = "SPY",
-          include_account: Optional[str] = None,
-          include_etf_holdings: Optional[str] = "false"):
+def proxy(symbol: str = Query(..., description="股票代码"), etf: str = "SPY"):
+    """给前端/其他服务用的单跳代理，内部转发到 /analyze。"""
     try:
-        url = f"{BASE_URL}/analyze?ticker={symbol}&etf={etf}&include_account={include_account}&include_etf_holdings={include_etf_holdings}"
-        resp = requests.get(url, timeout=HTTP_TIMEOUT)
-        return resp.json()
+        url = f"{BASE_URL}/analyze?ticker={symbol}&etf={etf}"
+        return http_json(url, timeout=30)
     except Exception as e:
-        return {"error": str(e), "symbol": symbol.upper()}
+        return {"error": str(e), "server_time_utc": now_utc_str()}
 
-# ================== /market ==================
+# -------------------- 市场聚合 --------------------
 @app.get("/market")
 def market():
-    out: Dict[str, Any] = {"indices":{}, "yields":{}, "etfs":{"snapshot":{}}, "news_top":[], "extras":{}}
-    core_indices = {"SPX_proxy_SPY":"SPY", "NDX_proxy_QQQ":"QQQ", "DJI_proxy_DIA":"DIA"}
-    core_etfs = ["SPY","QQQ","VTI","IWM","DIA","TLT","IEF","HYG","LQD"]
+    out = {"indices": {}, "yields": {}, "etfs": {"snapshot": {}}, "news_top": [], "extras": {}}
 
+    # 主要指数（用 ETF 代理）
     try:
-        sym_list = ",".join(sorted(set(list(core_indices.values()) + core_etfs)))
-        quotes = http_get_json(f"{BASE_URL}/prices?symbols={sym_list}") or {}
-        for k, sym in core_indices.items():
-            q = quotes.get(sym)
-            if q: out["indices"][k] = q
-        snap = {}
-        for sym in core_etfs:
-            q = quotes.get(sym)
-            if q: snap[sym] = {"price": q}
-        out["etfs"]["snapshot"] = snap
-    except Exception as e:
-        out["indices_error"] = str(e)
+        out["indices"]["SPX_proxy_SPY"] = finnhub_quote("SPY")
+        out["indices"]["NDX_proxy_QQQ"] = finnhub_quote("QQQ")
+        out["indices"]["DJI_proxy_DIA"] = finnhub_quote("DIA")
+    except Exception:
+        pass
 
+    # 国债收益率
     try:
-        for k, sid in {"US2Y":"DGS2","US5Y":"DGS5","US10Y":"DGS10","US30Y":"DGS30"}.items():
-            obs = fred_latest(sid)
-            if obs: out["yields"][k] = obs
-    except Exception as e:
-        out["yields_error"] = str(e)
+        series = {"US2Y": "DGS2", "US5Y": "DGS5", "US10Y": "DGS10", "US30Y": "DGS30"}
+        for k, sid in series.items():
+            url = (f"https://api.stlouisfed.org/fred/series/observations?"
+                   f"series_id={sid}&api_key={FRED_API_KEY}&file_type=json&sort_order=desc&limit=1")
+            d = http_json(url, timeout=15)
+            obs = (d.get("observations") or [])
+            if obs:
+                out["yields"][k] = {"series": sid, "date": obs[0]["date"], "value": obs[0]["value"]}
+    except Exception:
+        pass
 
+    # 常用 ETF 一览
     try:
-        for sym in ["SPY","QQQ"]:
-            arr = finnhub_company_news(sym, days=7)
-            for n in arr[:2]:
+        etfs = ["SPY", "QQQ", "VTI", "IWM", "DIA", "TLT", "IEF", "HYG", "LQD"]
+        for e in etfs:
+            out["etfs"]["snapshot"][e] = {"price": finnhub_quote(e)}
+    except Exception:
+        pass
+
+    # 顶部新闻（从 SPY/QQQ 各取 2 条）
+    try:
+        to_dt = datetime.utcnow().date()
+        from_dt = to_dt - timedelta(days=7)
+        for sym in ("SPY", "QQQ"):
+            url = (f"https://finnhub.io/api/v1/company-news"
+                   f"?symbol={sym}&from={from_dt.isoformat()}&to={to_dt.isoformat()}&token={FINNHUB_API_KEY}")
+            arr = http_json(url, timeout=15)[:2]
+            for it in arr:
                 out["news_top"].append({
-                    "headline": n.get("headline"),
-                    "url": n.get("url"),
+                    "headline": it.get("headline"),
+                    "url": it.get("url"),
                     "source_symbol": sym,
-                    "datetime": n.get("datetime")
+                    "datetime": it.get("datetime")
                 })
-    except Exception as e:
-        out["news_error"] = str(e)
+    except Exception:
+        pass
 
-    out["extras"]["server_time_utc"] = datetime.utcnow().isoformat()+"Z"
+    out["extras"]["server_time_utc"] = now_utc_str()
     return out
 
-# ================== /candles ==================
+# -------------------- Candles（技术因子，修复版） --------------------
+def _to_df_from_fmp_daily(j):
+    if not j or "historical" not in j or not j["historical"]:
+        return None
+    df = pd.DataFrame(j["historical"])
+    df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+    df = df.iloc[::-1].reset_index(drop=True)  # 最新在前 → 倒序
+    # 用日期列作为索引
+    if "date" in df.columns:
+        df["Date"] = pd.to_datetime(df["date"])
+        df.set_index("Date", inplace=True)
+    return df
+
+def _to_df_from_fmp_intraday(j):
+    if not isinstance(j, list) or len(j) == 0:
+        return None
+    df = pd.DataFrame(j)
+    df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+    df = df.iloc[::-1].reset_index(drop=True)
+    if "date" in df.columns:
+        df["Datetime"] = pd.to_datetime(df["date"])
+        df.set_index("Datetime", inplace=True)
+    return df
+
+def _to_df_from_finnhub_candles(j):
+    # {s: ok, t:[], o:[], h:[], l:[], c:[], v:[]}
+    if not j or j.get("s") != "ok":
+        return None
+    df = pd.DataFrame({
+        "Datetime": pd.to_datetime(j["t"], unit="s"),
+        "Open": j["o"],
+        "High": j["h"],
+        "Low":  j["l"],
+        "Close": j["c"],
+        "Volume": j["v"],
+    })
+    df.set_index("Datetime", inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+def _calc_daily_indicators(df: pd.DataFrame):
+    if df is None or df.empty or len(df) < 50:
+        return None
+    work = df.copy()
+    if "Close" not in work.columns or "High" not in work.columns or "Low" not in work.columns or "Open" not in work.columns:
+        return None
+    work["MA5"]  = work["Close"].rolling(5).mean()
+    work["MA20"] = work["Close"].rolling(20).mean()
+    work["MA50"] = work["Close"].rolling(50).mean()
+    # ATR14
+    high_low   = work["High"] - work["Low"]
+    high_close = (work["High"] - work["Close"].shift(1)).abs()
+    low_close  = (work["Low"]  - work["Close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    work["ATR14"] = tr.rolling(14).mean()
+
+    tail = work.iloc[-1]
+    return {
+        "ma5":  safe_round(tail["MA5"]),
+        "ma20": safe_round(tail["MA20"]),
+        "ma50": safe_round(tail["MA50"]),
+        "atr14": safe_round(tail["ATR14"]),
+        "asof": work.index[-1].strftime("%Y-%m-%d")
+    }
+
+def _calc_intraday_snapshot(df_intra: pd.DataFrame):
+    if df_intra is None or df_intra.empty:
+        return None
+    df = df_intra.copy()
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert(None)
+    last_day = df.index[-1].date()
+    day_df = df[df.index.date == last_day]
+    if day_df.empty:
+        return None
+    typical = (day_df["High"] + day_df["Low"] + day_df["Close"]) / 3.0
+    vol = day_df["Volume"].replace(0, pd.NA).fillna(0)
+    vwap = float((typical * vol).sum() / (vol.sum() or 1))
+    return {
+        "vwap":     safe_round(vwap),
+        "day_high": safe_round(day_df["High"].max()),
+        "day_low":  safe_round(day_df["Low"].min()),
+        "open":     safe_round(day_df["Open"].iloc[0]),
+        "last":     safe_round(day_df["Close"].iloc[-1]),
+        "date":     str(last_day)
+    }
+
 @app.get("/candles")
-def candles(symbol: str, intraday_res: str = "5", days: int = 40, debug: int = 0):
+def candles(symbol: str = "TSLA", intraday_res: int = 5, debug: int = 0):
     """
-    返回：
-      daily:  ma5/20/50, atr14, prev_high/prev_low, avg_vol20
-      intraday: vwap, day_high/day_low, open, last
-      candles: 最近100根 o/h/l/c/v/t
-      sources: 数据源(finnhub|yfinance|fmp)
-      errors:  错误提示
+    技术因子汇总：
+      - daily: ma5/ma20/ma50/atr14（来自 6 个月日线）
+      - intraday: vwap/day_high/day_low/open/last（最近交易日，默认 5 分钟 K）
+      - sources: 实际使用的数据源（yfinance | fmp | finnhub）
     """
-    out = {"symbol":symbol.upper(), "daily":{}, "intraday":{}, "candles":{}, "sources":{}, "errors":[]}
-    now = datetime.utcnow()
-    end_ts = int(now.timestamp())
-    start_daily = int((now - timedelta(days=max(days,40)+5)).timestamp())
+    out = {
+        "symbol": symbol.upper(),
+        "daily": {},
+        "intraday": {},
+        "candles": {},
+        "sources": {"daily": None, "intraday": None},
+        "errors": [],
+        "server_time_utc": now_utc_str(),
+    }
 
-    # ---- 日线 Finnhub -> yfinance -> FMP ----
-    daily_src = None
-    daily = finnhub_candles(symbol, "D", start_daily, end_ts)
-    if daily: daily_src = "finnhub"
-    else:
-        daily = yf_history(symbol, period=f"{max(days,40)+5}d", interval="1d")
-        if daily: daily_src = "yfinance"
-        else:
-            daily = fmp_daily(symbol, limit=max(days,120))
-            if daily: daily_src = "fmp"
-            else: out["errors"].append("daily_no_data")
+    yf_daily_len = 0
+    yf_intra_len = 0
 
-    if daily:
-        c = daily.get("c", []) or []
-        h = daily.get("h", []) or []
-        l = daily.get("l", []) or []
-        v = daily.get("v", []) or []
-        out["daily"] = {
-            "ma5": sma(c,5), "ma20": sma(c,20), "ma50": sma(c,50),
-            "atr14": atr14_from_daily(h,l,c),
-            "prev_high": h[-2] if len(h)>=2 else None,
-            "prev_low":  l[-2] if len(l)>=2 else None,
-            "avg_vol20": sma(v,20),
-        }
-    out["sources"]["daily"] = daily_src
+    # 1) yfinance（优先）
+    try:
+        import yfinance as yf
+        ddf = yf.download(symbol, period="6mo", interval="1d", auto_adjust=False, progress=False, threads=False, prepost=False)
+        yf_daily_len = 0 if ddf is None else len(ddf)
+        if ddf is not None and not ddf.empty:
+            ddf = ddf.rename(columns=str.title)  # Open/High/Low/Close/Volume
+            daily_calc = _calc_daily_indicators(ddf)
+            if daily_calc:
+                out["daily"] = daily_calc
+                out["sources"]["daily"] = "yfinance"
 
-    # ---- 分钟 Finnhub -> yfinance -> FMP ----
-    intra_src = None
-    start_intraday = int(datetime(now.year, now.month, now.day).timestamp())
-    intra = finnhub_candles(symbol, intraday_res, start_intraday, end_ts)
-    if intra: intra_src = "finnhub"
-    else:
-        candidates = [f"{intraday_res}m"] if intraday_res.isdigit() else []
-        for iv in ["1m","2m","5m"]:
-            if iv not in candidates: candidates.append(iv)
-        yfintra = None
-        for iv in candidates:
-            yfintra = yf_history(symbol, period="7d", interval=iv)
-            if yfintra: break
-        intra = yfintra
-        if intra: intra_src = "yfinance"
-        else:
-            iv_map = {"1":"1min","2":"1min","5":"5min","15":"15min","30":"30min","60":"1hour"}
-            fiv = iv_map.get(intraday_res, "5min")
-            intra = fmp_intraday(symbol, interval=fiv, limit=300)
-            if intra: intra_src = "fmp"
-            else: out["errors"].append("intraday_no_data")
+        interval = f"{max(1, min(int(intraday_res), 60))}m"
+        idf = yf.download(symbol, period="5d", interval=interval, auto_adjust=False, progress=False, threads=False, prepost=False)
+        yf_intra_len = 0 if idf is None else len(idf)
+        if idf is not None and not idf.empty:
+            idf = idf.rename(columns=str.title)
+            intra_calc = _calc_intraday_snapshot(idf)
+            if intra_calc:
+                out["intraday"] = intra_calc
+                out["sources"]["intraday"] = "yfinance"
+    except Exception as e:
+        out["errors"].append(f"yf_error:{e}")
 
-    if intra:
-        h = intra.get("h", []) or []
-        l = intra.get("l", []) or []
-        c = intra.get("c", []) or []
-        o = intra.get("o", []) or []
-        v = intra.get("v", []) or []
-        t = intra.get("t", []) or []
-        out["intraday"] = {
-            "res": intraday_res,
-            "vwap": vwap_from_intraday(h,l,c,v),
-            "day_high": max(h) if h else None,
-            "day_low":  min(l) if l else None,
-            "open": o[0] if o else None,
-            "last": c[-1] if c else None,
-            "last_ts": t[-1] if t else None
-        }
-        k = max(0, len(t)-100)
-        out["candles"] = {"res":intraday_res, "t":t[k:], "o":o[k:], "h":h[k:], "l":l[k:], "c":c[k:], "v":v[k:]}
+    # 2) FMP 回退
+    try:
+        if out["sources"]["daily"] is None and FMP_API_KEY:
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=260&apikey={FMP_API_KEY}"
+            j = http_json(url, timeout=20)
+            df = _to_df_from_fmp_daily(j)
+            daily_calc = _calc_daily_indicators(df)
+            if daily_calc:
+                out["daily"] = daily_calc
+                out["sources"]["daily"] = "fmp"
 
-    out["sources"]["intraday"] = intra_src
-    out["server_time_utc"] = datetime.utcnow().isoformat()+"Z"
+        if out["sources"]["intraday"] is None and FMP_API_KEY:
+            res = max(1, min(int(intraday_res), 60))
+            url = f"https://financialmodelingprep.com/api/v3/historical-chart/{res}min/{symbol}?apikey={FMP_API_KEY}"
+            j = http_json(url, timeout=20)
+            df = _to_df_from_fmp_intraday(j)
+            intra_calc = _calc_intraday_snapshot(df)
+            if intra_calc:
+                out["intraday"] = intra_calc
+                out["sources"]["intraday"] = "fmp"
+    except Exception as e:
+        out["errors"].append(f"fmp_error:{e}")
+
+    # 3) Finnhub 兜底
+    try:
+        if out["sources"]["daily"] is None and FINNHUB_API_KEY:
+            fro = int((datetime.utcnow() - timedelta(days=400)).timestamp())
+            to  = int(datetime.utcnow().timestamp())
+            url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=D&from={fro}&to={to}&token={FINNHUB_API_KEY}"
+            j = http_json(url, timeout=20)
+            df = _to_df_from_finnhub_candles(j)
+            if df is not None and not df.empty:
+                daily_calc = _calc_daily_indicators(df)
+                if daily_calc:
+                    out["daily"] = daily_calc
+                    out["sources"]["daily"] = "finnhub"
+
+        if out["sources"]["intraday"] is None and FINNHUB_API_KEY:
+            fro = int((datetime.utcnow() - timedelta(days=7)).timestamp())
+            to  = int(datetime.utcnow().timestamp())
+            res = max(1, min(int(intraday_res), 60))
+            url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution={res}&from={fro}&to={to}&token={FINNHUB_API_KEY}"
+            j = http_json(url, timeout=20)
+            df = _to_df_from_finnhub_candles(j)
+            intra_calc = _calc_intraday_snapshot(df)
+            if intra_calc:
+                out["intraday"] = intra_calc
+                out["sources"]["intraday"] = "finnhub"
+    except Exception as e:
+        out["errors"].append(f"fh_error:{e}")
+
+    if not out["daily"]:
+        out["errors"].append("daily_no_data")
+    if not out["intraday"]:
+        out["errors"].append("intraday_no_data")
+
     if debug:
         out["debug"] = {
-            "daily_len": len(daily.get("c",[])) if daily else 0,
-            "intra_len": len(intra.get("c",[])) if intra else 0
+            "daily_len": int(yf_daily_len),
+            "intra_len": int(yf_intra_len),
         }
+
     return out
 
-# ================== /events ==================
+# -------------------- 事件日历 --------------------
 @app.get("/events")
-def events(symbols: str = "", days: int = 14):
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    today = datetime.utcnow().date()
-    to = today + timedelta(days=days)
-    out: Dict[str, Any] = {"earnings": {}, "macro": []}
-
+def events(symbols: str = "AAPL,TSLA", days: int = 14):
+    """
+    未来 N 天财报（按 symbol 过滤）+ 若需可扩展宏观事件
+    """
+    res = {"earnings": {}, "macro": [], "server_time_utc": now_utc_str()}
     try:
-        if FINNHUB_API_KEY:
-            from_str = today.isoformat(); to_str = to.isoformat()
-            url = f"https://finnhub.io/api/v1/calendar/earnings?from={from_str}&to={to_str}&token={FINNHUB_API_KEY}"
-            js = http_get_json(url) or {}
-            items = js.get("earningsCalendar", [])
-            if syms: items = [x for x in items if (x.get("symbol") or "").upper() in syms]
-            bysym: Dict[str, List[Dict[str, Any]]] = {}
-            for it in items:
-                s = (it.get("symbol") or "").upper()
-                bysym.setdefault(s, []).append({
+        to_dt = datetime.utcnow().date() + timedelta(days=max(1, int(days)))
+        from_dt = datetime.utcnow().date()
+        for sym in [x.strip().upper() for x in symbols.split(",") if x.strip()]:
+            # Finnhub：支持 symbol 指定
+            url = (f"https://finnhub.io/api/v1/calendar/earnings"
+                   f"?from={from_dt.isoformat()}&to={to_dt.isoformat()}&symbol={sym}&token={FINNHUB_API_KEY}")
+            j = http_json(url, timeout=20)
+            arr = (j.get("earningsCalendar") or [])
+            if arr:
+                # 精简几个核心字段
+                res["earnings"][sym] = [{
                     "date": it.get("date"),
                     "hour": it.get("hour"),
                     "epsEstimate": it.get("epsEstimate"),
-                    "revenueEstimate": it.get("revenueEstimate")
-                })
-            out["earnings"] = bysym
+                    "revenueEstimate": it.get("revenueEstimate"),
+                } for it in arr]
     except Exception:
-        out["earnings"] = {}
-
-    try:
-        out["macro"] = (lambda frm,to: (
-            fmp_macro_calendar(frm,to) if FMP_API_KEY else []
-        ))(today.isoformat(), to.isoformat())
-    except Exception:
-        out["macro"] = []
-
-    out["server_time_utc"] = datetime.utcnow().isoformat()+"Z"
-    return out
-
-# ================== 本地启动 ==================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=True)
+        pass
+    return res
